@@ -198,7 +198,11 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 			warpPool.Close()
 		}
 	}
-	gateway, err := New(cfg, m.logger, m.monitor, warpPool)
+	rotatePath := ""
+	if m.configPath != "" {
+		rotatePath = m.configPath + ".egress-rotation.json"
+	}
+	gateway, err := NewWithState(cfg, m.logger, m.monitor, warpPool, rotatePath)
 	if err != nil {
 		discardWARP()
 		return nil, err

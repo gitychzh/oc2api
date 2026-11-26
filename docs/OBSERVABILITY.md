@@ -68,6 +68,13 @@ API key、完整请求体。`SecretRedactor` 会对日志做最后一道脱敏�
 | `anonymous_breaker_open` | WARN | 匿名车道熔断（连续失败，或全部出口被封锁） |
 | `proxy_unavailable` | WARN | 代理不可达 → 键被迁走，带 `zen_keys_moved` / `go_keys_moved` |
 | `proxy_restored` | INFO | 代理恢复 → 键迁回、匿名冷却清零 |
+| `exit_rotation_started` | INFO | 开始换 IP，带 `exit`、`trigger`、`ip_from` |
+| `exit_rotation_succeeded` | INFO | IP 已变，带 `ip_from` / `ip_to` / `elapsed_s` |
+| `exit_rotation_budget` | INFO | 该出口当日 token 预算被跨过 |
+| `exit_rotation_quota` | WARN | 硬 429 触发换 IP，带 `reason` |
+| `exit_rotation_unchanged` | WARN | 重启后 IP 没变 —— **这是失败**，出口保持封锁 |
+| `exit_rotation_failed` | WARN | agent 明确拒绝 |
+| `exit_rotation_timeout` | WARN | 超时未恢复 |
 
 > **降权（demote）当前不打日志**：它每个请求都可能发生，打日志会淹没有用信息。
 > 它的可观测性来自尝试记录里的 `proxy` 字段与 `status`/`error`：同一出口连续
@@ -183,6 +190,10 @@ API key、完整请求体。`SecretRedactor` 会对日志做最后一道脱敏�
 **就绪不保证 Key 有效、额度充足或推理成功。** 公开响应只含计数与状态，
 不含凭据或代理地址。
 
+配了 `egress_agents` 时响应多一个 `rotation` 数组：每个出口的当日 token 用量、
+是否已触发、是否正在换 IP、上次结果与 IP。它是排"这个出口今天为什么不动了"的
+第一手数据。
+
 ## 5. 排障时的查询路径
 
 | 问题 | 看哪里 |
@@ -192,6 +203,8 @@ API key、完整请求体。`SecretRedactor` 会对日志做最后一道脱敏�
 | 无模型 / health 503 | 目录状态、原生协议支持、凭证配置、资源可用性 |
 | HTTP 200 但生成失败 | SSE 错误事件、请求结果、`x-request-id` 对应的日志 |
 | 429 | **按六道门顺序排**（`PROTOCOL_FACTS.md` §1），别直接怀疑配额 |
+| 出口一直 429 但没换 IP | 看 `rotation[]`：`triggered=true` 且 `rotations` 不涨 = 换 IP 失败；`last_result` 说原因 |
+| 换 IP 后还是 429 | `exit_rotation_unchanged` = ISP 发了同一个地址；或撞的是六道门里换 IP 治不好的那几道 |
 | 本地 400 vs 上游 400 | 耗时（ms vs 秒）+ 是否有 `prompt_gate_refused` |
 | 修改无效 | 保存/重载实际配置；监听变化需重启 |
 | 重启后用量清零 | 计数器仅在内存，日志需另外保存 |

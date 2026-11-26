@@ -141,10 +141,59 @@
 | `exit_demote_seconds` | 20 | 降权基础窗口，按连续失败翻倍 |
 | `exit_demote_max_seconds` | 300 | 降权窗口上限 |
 | `free_tier_block_seconds` | 900 | cordon 窗口（IP 判决） |
+| `exit_rotate_seconds` | 180 | 一次换 IP 的等待上限（重启 ~80s + 重拨 ~40s） |
+| `exit_rotate_min_interval_seconds` | 1800 | 同一出口两次换 IP 的最小间隔 |
 | `max_anonymous_exits` | 8 | 单请求可走的不同静态出口上限 |
 
 实现：`internal/gateway/pool.go` 的 `proxyTransport.demotedUntil` /
 `markDemoted` / `clearDemotion`，以及 `anonymousCursor.Next()` 的两级排序。
+
+### 6.2.1 换 IP（rotation）：第三档判决
+
+配额是**按出口 IP 计**的，所以"换一个 IP"是唯一能重置额度的办法。这由
+`internal/gateway/rotate.go` 负责，配置是 `egress_agents`。
+
+每个可换 IP 的出口配一个 **egress-agent**：一个守在上行链路旁的守护进程，同一个
+端口上做三件事——它就是这个出口的 CONNECT 代理、`GET /healthz` 报告当前出口 IP、
+`POST /rotate` 重启路由器。**路由器凭据在 agent 上，不在网关配置里**，所以
+`config.json` 可以在主机之间复制而不带走设备密码。
+
+触发只有两条，都很窄：
+
+| 触发 | 条件 | 为什么这么窄 |
+|---|---|---|
+| **token 预算** | 本 UTC 日该出口估算 prompt token 累计超过 `token_budget` | 上游按 token 计量，不按调用数；按请求数触发会在额度已经烧完之后才动 |
+| **硬 429** | `Retry-After` 缺失，或 > 1 小时 | 短 `Retry-After` 是阵发节流，会自愈；为它重启路由器只会延长故障 |
+
+**裸 429 永不触发换 IP。** 这是从事故里学来的：429 有四个互斥成因，只有一个能被
+新 IP 治好，而"见到 429 就重启"曾让三个出口在一天内分别重启 32/20/13 次，每次重启
+都掐断了正在测量的那条隧道。
+
+约束：
+
+- 同一出口两次换 IP 之间至少 `exit_rotate_min_interval_seconds`（默认 30 分钟）。
+  真实日额度只需要重置一次。
+- 换 IP 在**后台 goroutine** 里跑，客户端请求不等它——重启要几分钟，发现额度烧穿的
+  那个请求应该由别的出口答完。
+- **回来的 IP 没变 = 失败**。ISP 有时把刚断的地址重新发下来，记成成功会让该出口
+  在余下的日子里一直处于封锁状态而没人看。
+- 换 IP 成功后解除该出口的 cordon：那个判决是针对旧地址的，地址变了它就不成立了。
+
+```json
+"egress_agents": {
+  "10.0.0.2:10001": {
+    "name": "home-mobile",
+    "agent_url": "http://10.0.0.2:10001",
+    "secret": "shared-secret-with-the-agent",
+    "token_budget": 9000000
+  }
+}
+```
+
+键是 `proxies` 里那个代理的 host（或整条 URL）。没配 agent 的代理照常能用，只是
+额度烧穿后只能等 UTC 日重置。
+
+`GET /healthz` 的 `rotation` 数组报告每个出口的当日用量、触发状态与上次结果。
 
 ### 6.3 匿名车道熔断
 
@@ -238,6 +287,7 @@ Go/付费/OAuth 路由**继续用配置的代理**，不走 WARP。
 | `internal/gateway/policy.go` | 字符门统计与本地 400 |
 | `internal/protocol/estimate.go` | 补 usage 的密度系数 |
 | `internal/gateway/pool.go`（增量） | 降权判决 |
+| `internal/gateway/rotate.go` | 换 IP 控制器（token 预算 + 硬 429 触发） |
 | `AGENTS.md`、`docs/*` | 本套文档 |
 
 上游改动频繁（免费层校验在持续变化），所以改动尽量落在这几个文件里，减少合并

@@ -46,11 +46,16 @@ type RequestMeta struct {
 	// ToolRenames counts the client tools the free-tier shaper renamed with
 	// the wire-name prefix. The upstream response is rewritten back to the
 	// client's names before it is returned.
-	ToolRenames    int
-	Usage          protocol.Usage
-	UsageReported  bool
-	AttemptOutcome string
-	Outcome        string
+	ToolRenames   int
+	Usage         protocol.Usage
+	UsageReported bool
+	// EstimatedPromptTokens is the gateway's own estimate of the prompt the
+	// request carried. The free tier returns no usage on streams, so this is
+	// the only per-request spend figure available on the anonymous lane, and
+	// the egress rotation budget is metered from it.
+	EstimatedPromptTokens int
+	AttemptOutcome        string
+	Outcome               string
 }
 
 // PlaygroundServerKey buckets admin Playground traffic, which authenticates

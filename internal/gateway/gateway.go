@@ -95,6 +95,14 @@ type Gateway struct {
 	// freeTierBlock is how long an exit the free tier flagged stays out of the
 	// anonymous cursor. Zero uses freeTierBlockTTL.
 	freeTierBlock time.Duration
+	// rotator renews egress IPs by asking each exit's agent to reboot the
+	// router. Nil when no exit has an agent configured, which callers treat as
+	// "rotation is off" rather than as an error.
+	rotator *rotator
+	// rotateTimeout and rotateMinInterval bound one rotation and the floor
+	// between two of them for the same exit.
+	rotateTimeout     time.Duration
+	rotateMinInterval time.Duration
 	// refreshMu prevents overlapping catalog refreshes across concurrent or scheduled callers.
 	refreshMu              sync.Mutex
 	resolveGoOAuth         func(context.Context) (*oauth.Connection, error)
@@ -109,6 +117,13 @@ type Gateway struct {
 // rotation manager is not persisted; RuntimeController replaces it with the
 // shared one.
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, warpPool *warp.Pool) (*Gateway, error) {
+	return NewWithState(cfg, logger, monitor, warpPool, "")
+}
+
+// NewWithState is New plus the path the rotation counters persist to. An empty
+// statePath keeps them in memory, which is right for tests and for a caller
+// that has no config file to sit next to.
+func NewWithState(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, warpPool *warp.Pool, statePath string) (*Gateway, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -159,8 +174,48 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 		attemptTimeout: attemptDeadline(cfg),
 		freeTierBlock:  time.Duration(cfg.Performance.FreeTierBlockSeconds) * time.Second,
 	}
+	gateway.rotateTimeout, gateway.rotateMinInterval = rotateWindow(cfg)
+	gateway.rotator = newRotator(
+		rotationTargetsFromTransports(transports, egressAgentSpecs(cfg.EgressAgents)),
+		statePath,
+		func(event string, args ...any) {
+			logger.Info("egress rotation", append([]any{"component", "rotation", "event", event}, args...)...)
+		},
+	)
 	gateway.restoreOAuthCatalog()
 	return gateway, nil
+}
+
+// rotateWindow returns how long one rotation may take and the floor between
+// two rotations of the same exit, falling back to the built-in values.
+func rotateWindow(cfg config.Config) (timeout, minInterval time.Duration) {
+	timeout = rotateTimeoutDefault
+	if cfg.Performance.ExitRotateSeconds > 0 {
+		timeout = time.Duration(cfg.Performance.ExitRotateSeconds) * time.Second
+	}
+	minInterval = rotateMinIntervalDefault
+	if cfg.Performance.ExitRotateMinIntervalSeconds > 0 {
+		minInterval = time.Duration(cfg.Performance.ExitRotateMinIntervalSeconds) * time.Second
+	}
+	return timeout, minInterval
+}
+
+// egressAgentSpecs converts the configured agents into the controller's
+// shape, keyed by the proxy host they renew.
+func egressAgentSpecs(agents map[string]config.EgressAgentConfig) map[string]egressAgentSpec {
+	if len(agents) == 0 {
+		return nil
+	}
+	specs := make(map[string]egressAgentSpec, len(agents))
+	for key, agent := range agents {
+		specs[key] = egressAgentSpec{
+			Name:        agent.Name,
+			AgentURL:    agent.AgentURL,
+			Secret:      agent.Secret,
+			TokenBudget: agent.TokenBudget,
+		}
+	}
+	return specs
 }
 
 // demoteWindow returns the per-exit demotion window and its ceiling from the
@@ -402,6 +457,14 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			return
 		}
 		stream := jsonutil.BoolAt(payload, "stream")
+		// Record the prompt spend before the attempt, because the anonymous
+		// lane's per-exit rotation budget is metered from it and the attempt
+		// outcome is what triggers a rotation. The estimate is the same one
+		// handed to the stream writer below.
+		promptEstimate := estimatePromptTokens(payload, external)
+		if meta := telemetry.MetaFromContext(r.Context()); meta != nil {
+			meta.EstimatedPromptTokens = promptEstimate
+		}
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
 		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)
@@ -506,7 +569,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			// client reads zero tokens for the whole session. Hand the
 			// measured prompt estimate down for ForwardStream to emit when the
 			// upstream reports nothing.
-			estimate := wire.Usage{Input: estimatePromptTokens(payload, external)}
+			estimate := wire.Usage{Input: promptEstimate}
 			if external == upstreamRoute.Protocol {
 				streamWriter := w
 				if flusher, ok := w.(http.Flusher); ok {

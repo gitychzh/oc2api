@@ -21,7 +21,11 @@ type healthResponse struct {
 	Keys    healthKeys    `json:"keys"`
 	Proxies healthProxies `json:"proxies"`
 	Warp    *healthWarp   `json:"warp,omitempty"`
-	Issues  []string      `json:"issues,omitempty"`
+	// Rotation reports the exits that can renew their egress IP. Omitted when
+	// no exit has an agent, so a deployment without rotation sees the same
+	// document as before.
+	Rotation []map[string]any `json:"rotation,omitempty"`
+	Issues   []string         `json:"issues,omitempty"`
 }
 
 type healthModels struct {
@@ -168,8 +172,9 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Healthy:   proxyHealthy,
 			Unhealthy: proxyTotal - proxyHealthy,
 		},
-		Warp:   warpStatus,
-		Issues: issues,
+		Warp:     warpStatus,
+		Rotation: g.rotator.snapshot(),
+		Issues:   issues,
 	})
 }
 

@@ -41,14 +41,24 @@ type Config struct {
 	Proxies           []string                     `json:"proxies"`
 	ProxyFile         string                       `json:"proxyfile"`
 	ProxyBindings     map[string]string            `json:"proxy_bindings,omitempty"`
-	Upstream          UpstreamConfig               `json:"upstream"`
-	Retry             RetryConfig                  `json:"retry"`
-	Models            ModelsConfig                 `json:"models"`
-	Performance       PerformanceConfig            `json:"performance"`
-	Logging           LoggingConfig                `json:"logging"`
-	WebUI             WebUIConfig                  `json:"webui"`
-	Prefer            Tier                         `json:"prefer"`
-	Reasoning         ReasoningConfig              `json:"reasoning"`
+	// EgressAgents maps a proxy entry to the egress-agent that can renew its
+	// IP. The key is the proxy's host (or its whole URL) as written in
+	// Proxies; the value names the agent's control URL and shared secret.
+	//
+	// This is what makes an exit rotatable. Without an entry the proxy is a
+	// plain exit: usable, but a burned allowance on it can only wait for the
+	// UTC-day reset. The secret belongs to the agent, never to the router —
+	// the agent owns the router credentials, so nothing here can reboot a
+	// device that the agent was not already trusted to reach.
+	EgressAgents map[string]EgressAgentConfig `json:"egress_agents,omitempty"`
+	Upstream     UpstreamConfig               `json:"upstream"`
+	Retry        RetryConfig                  `json:"retry"`
+	Models       ModelsConfig                 `json:"models"`
+	Performance  PerformanceConfig            `json:"performance"`
+	Logging      LoggingConfig                `json:"logging"`
+	WebUI        WebUIConfig                  `json:"webui"`
+	Prefer       Tier                         `json:"prefer"`
+	Reasoning    ReasoningConfig              `json:"reasoning"`
 
 	effectiveProxies []string
 }
@@ -86,6 +96,33 @@ type WarpConfig struct {
 	// replacement exit a new public egress; without it, exits share one
 	// address and an egress-scoped free quota stays exhausted.
 	SourceIPv6 string `json:"source_ipv6,omitempty"`
+}
+
+// EgressAgentConfig is one egress-agent's control endpoint.
+//
+// The agent is a small daemon on the uplink's own machine. It serves three
+// duties on one port: it is the CONNECT proxy the gateway dials through, it
+// reports the IP it currently leaves from on /healthz, and it reboots the
+// router on POST /rotate. Keeping the router credentials there (rather than
+// here) is the point of the split: this file can be copied between hosts
+// without carrying a device password.
+type EgressAgentConfig struct {
+	// Name is how the exit is labelled in logs and the rotation snapshot.
+	// Defaults to the agent URL's host when empty.
+	Name string `json:"name,omitempty"`
+	// AgentURL is the agent's base URL, for example
+	// "http://100.109.109.108:10002". It must be reachable without going
+	// through the proxy pool — the agent is usually on the tailnet.
+	AgentURL string `json:"agent_url"`
+	// Secret is the agent's shared secret, sent as Basic auth with the secret
+	// as both user and password. Empty means the agent's control endpoints are
+	// unauthenticated.
+	Secret string `json:"secret,omitempty"`
+	// TokenBudget is the estimated prompt-token spend on this exit that
+	// triggers a rotation. The upstream meters tokens, not calls, so this is
+	// the trigger that fires before the allowance is gone. Zero leaves only
+	// the hard-429 trigger enabled.
+	TokenBudget int64 `json:"token_budget,omitempty"`
 }
 
 // Normalize fills the defaults and canonicalizes the stack name.
@@ -311,6 +348,17 @@ type PerformanceConfig struct {
 	// ExitDemoteMaxSeconds caps the demotion window. Zero uses the built-in
 	// 300 seconds.
 	ExitDemoteMaxSeconds int `json:"exit_demote_max_seconds"`
+	// ExitRotateSeconds bounds one egress-IP rotation: the wait for the uplink
+	// to come back and for the ISP to redial. A router reboot is ~80s and the
+	// redial another ~40s, so a value below two minutes fails rotations that
+	// were going to succeed. Zero uses the built-in 180 seconds.
+	ExitRotateSeconds int `json:"exit_rotate_seconds"`
+	// ExitRotateMinIntervalSeconds is the floor between two rotations of the
+	// same exit, regardless of whether the previous one succeeded. A real
+	// daily allowance only needs one reset, so a short floor lets a burst of
+	// 429s reboot the router repeatedly and tear down the tunnel being
+	// measured. Zero uses the built-in 1800 seconds (half an hour).
+	ExitRotateMinIntervalSeconds int `json:"exit_rotate_min_interval_seconds"`
 }
 
 // AttemptTimeout returns the bound for a single upstream attempt. When
@@ -497,6 +545,12 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if cfg.Performance.ExitDemoteSeconds < 0 || cfg.Performance.ExitDemoteMaxSeconds < 0 {
 		return Config{}, errors.New("performance.exit_demote_seconds and exit_demote_max_seconds must not be negative (0 uses the built-in window)")
 	}
+	if cfg.Performance.ExitRotateSeconds < 0 {
+		return Config{}, errors.New("performance.exit_rotate_seconds must not be negative (0 uses the built-in 180 seconds)")
+	}
+	if cfg.Performance.ExitRotateMinIntervalSeconds < 0 {
+		return Config{}, errors.New("performance.exit_rotate_min_interval_seconds must not be negative (0 uses the built-in 1800 seconds)")
+	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
 	}
@@ -541,7 +595,46 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if err := normalizeProxyBindings(&cfg); err != nil {
 		return Config{}, err
 	}
+	if err := normalizeEgressAgents(&cfg); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+// normalizeEgressAgents trims and validates the rotation agents.
+//
+// An agent URL is refused unless it is http(s) with a host: the controller
+// POSTs to it, so a bare hostname or a typo would surface as a rotation that
+// silently never happens. Unknown agents (a proxy that names no entry) are not
+// an error — most exits are not rotatable — but a malformed entry is, because
+// it means the operator intended rotation and it would not work.
+func normalizeEgressAgents(cfg *Config) error {
+	if len(cfg.EgressAgents) == 0 {
+		return nil
+	}
+	normalized := make(map[string]EgressAgentConfig, len(cfg.EgressAgents))
+	for key, agent := range cfg.EgressAgents {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			return errors.New("egress_agents contains an empty key")
+		}
+		agent.Name = strings.TrimSpace(agent.Name)
+		agent.AgentURL = strings.TrimRight(strings.TrimSpace(agent.AgentURL), "/")
+		agent.Secret = strings.TrimSpace(agent.Secret)
+		if agent.AgentURL == "" {
+			return fmt.Errorf("egress_agents[%s].agent_url must not be empty", trimmedKey)
+		}
+		parsed, err := url.Parse(agent.AgentURL)
+		if err != nil || parsed.Host == "" || (strings.ToLower(parsed.Scheme) != "http" && strings.ToLower(parsed.Scheme) != "https") {
+			return fmt.Errorf("egress_agents[%s].agent_url must be an http or https URL", trimmedKey)
+		}
+		if agent.TokenBudget < 0 {
+			return fmt.Errorf("egress_agents[%s].token_budget must not be negative (0 disables the budget trigger)", trimmedKey)
+		}
+		normalized[trimmedKey] = agent
+	}
+	cfg.EgressAgents = normalized
+	return nil
 }
 
 func remapServerKeyMetadata(cfg *Config) {

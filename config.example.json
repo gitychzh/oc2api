@@ -13,6 +13,20 @@
   },
   "proxies": ["direct"],
   "proxyfile": "",
+  // Optional. Each entry makes the proxy whose host it names rotatable: on a
+  // burned daily allowance the gateway asks that egress-agent to reboot the
+  // uplink, waits for the IP to change, and lifts the exit's block. The agent
+  // owns the router credentials, so none appear here. Without an entry the
+  // proxy still works, but a burned allowance can only wait for the UTC-day
+  // reset. See docs/PROTOCOL_FACTS.md §8 and docs/ARCHITECTURE.md §6.
+  // "egress_agents": {
+  //   "10.0.0.2:10001": {
+  //     "name": "home-mobile",
+  //     "agent_url": "http://10.0.0.2:10001",
+  //     "secret": "shared-secret-with-the-agent",
+  //     "token_budget": 9000000
+  //   }
+  // },
   "upstream": {
     "zen": "https://opencode.ai/zen",
     "go": "https://opencode.ai/zen/go",
@@ -41,7 +55,9 @@
     "max_anonymous_exits": 8,
     "free_tier_block_seconds": 900,
     "exit_demote_seconds": 20,
-    "exit_demote_max_seconds": 300
+    "exit_demote_max_seconds": 300,
+    "exit_rotate_seconds": 180,
+    "exit_rotate_min_interval_seconds": 1800
   },
   "logging": {
     "level": "info",

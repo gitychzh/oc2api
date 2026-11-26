@@ -1209,7 +1209,9 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 	if err == nil && status/100 == 2 {
 		g.anonymous.MarkSuccess(node)
 		g.anonymous.NoteSuccess()
+		g.noteEgressSpend(ctx, node, resp)
 	} else {
+		g.noteEgressQuota(node, resp, err)
 		g.anonymous.MarkFailure(node, resp, err)
 		if resp != nil && peekNetworkAbuseBlock(resp) {
 			// An IP block is scoped to this exit; doAnonymousUpstream marks it
