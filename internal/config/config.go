@@ -294,6 +294,23 @@ type PerformanceConfig struct {
 	// abusive stays out of the anonymous cursor. Upstream does not publish
 	// the block duration, so the default is a conservative 15 minutes.
 	FreeTierBlockSeconds int `json:"free_tier_block_seconds"`
+	// ExitDemoteSeconds is the base demotion applied to an exit after a
+	// transport failure or a 5xx. A demoted exit is not removed from the
+	// rotation: it moves to the end of the selection order so the current
+	// request is answered by another exit, and the next request still
+	// considers it. The window grows with consecutive failures up to
+	// ExitDemoteMaxSeconds and clears on the first success. Zero uses the
+	// built-in 20 seconds.
+	//
+	// This is deliberately separate from free_tier_block_seconds, which is a
+	// verdict about the egress IP: only the free tier can pronounce that one,
+	// and only its expiry or a changed IP may lift it. Treating a transport
+	// failure as an IP verdict is what makes a flaky LTE leg look like a
+	// burned quota and triggers pointless rotation.
+	ExitDemoteSeconds int `json:"exit_demote_seconds"`
+	// ExitDemoteMaxSeconds caps the demotion window. Zero uses the built-in
+	// 300 seconds.
+	ExitDemoteMaxSeconds int `json:"exit_demote_max_seconds"`
 }
 
 // AttemptTimeout returns the bound for a single upstream attempt. When
@@ -476,6 +493,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Performance.FreeTierBlockSeconds < 0 {
 		return Config{}, errors.New("performance.free_tier_block_seconds must not be negative (0 uses the built-in cool-down)")
+	}
+	if cfg.Performance.ExitDemoteSeconds < 0 || cfg.Performance.ExitDemoteMaxSeconds < 0 {
+		return Config{}, errors.New("performance.exit_demote_seconds and exit_demote_max_seconds must not be negative (0 uses the built-in window)")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")

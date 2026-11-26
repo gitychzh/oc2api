@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"opencode2api/internal/jsonutil"
 )
@@ -177,12 +178,19 @@ func ClientCanceled(ctx context.Context, streamErr error) bool {
 // oversized or unterminated frame is never written downstream. Before the
 // first frame a failure is a JSON 502; later failures are SSE error events.
 // A canceled client gets no synthetic error event.
-func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, protocol Protocol, model string) (Usage, bool, error) {
+//
+// estimatedInput is the prompt usage the gateway measured before sending the
+// request. When the upstream reports no usage at all — the free tier's normal
+// behaviour on a stream — one frame is synthesised from it just before the
+// terminal frame, marked "estimated": true. A nil estimate, or an upstream
+// that did report usage, produces no extra frame.
+func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, protocol Protocol, model string, estimatedInput *Usage) (Usage, bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
 	}
 	observer := streamUsageObserver(protocol)
+	observer.estimate = estimatedInput
 	committed := false
 	observer.forward = func(frame []byte) error {
 		committed = true
@@ -654,12 +662,29 @@ type streamUsageTracker struct {
 	normal   bool
 	error    bool
 	parseErr error
+	// protocol, id and model describe the relayed stream, so a synthesised
+	// usage frame can be shaped for it.
+	protocol Protocol
+	id       string
+	model    string
+	// estimate, when non-nil, is a prompt usage the gateway measured before
+	// sending the request. It is used only when the upstream reports no usage
+	// at all, which is the free tier's normal behaviour.
+	estimate *Usage
+	// terminal marks a frame that ends the stream, so a synthesised usage
+	// frame can be written just before it.
+	terminal bool
+	// generated counts the characters the assistant produced, for the
+	// completion side of a synthesised usage frame.
+	generated int
+	// synthesised records that a usage frame was written from estimate.
+	synthesised bool
 }
 
 // streamUsageObserver builds a usage tracker whose parser reads the given
 // protocol.
 func streamUsageObserver(protocol Protocol) *streamUsageTracker {
-	return &streamUsageTracker{parser: &bridgeStreamParser{
+	return &streamUsageTracker{protocol: protocol, parser: &bridgeStreamParser{
 		protocol: protocol, tools: map[string]bool{}, toolIDs: map[string]string{}, toolNames: map[string]string{},
 		responseArgs: map[string]bool{}, responseReasoning: map[string]bool{},
 	}}
@@ -693,6 +718,14 @@ func (observer *streamUsageTracker) Write(data []byte) (int, error) {
 			if observer.error {
 				return len(data) - len(remaining), errStreamUpstreamFailure
 			}
+			if observer.terminal {
+				// The upstream is about to end the stream without having
+				// reported usage. Write the estimate first, so it lands where
+				// a client already looks for a usage frame.
+				if err := observer.emitEstimatedUsage(); err != nil {
+					return len(data) - len(remaining), err
+				}
+			}
 			if observer.forward != nil {
 				if err := observer.forward(observer.buffer[:index+width]); err != nil {
 					return len(data) - len(remaining), err
@@ -714,6 +747,51 @@ func (observer *streamUsageTracker) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
+// emitEstimatedUsage writes one usage frame synthesised from the estimate the
+// gateway measured before the request, when the upstream reported none.
+//
+// Only Chat is synthesised: there the usage frame is a separate
+// choices:[] chunk, so adding one is invisible to a client that does not read
+// it. Anthropic and Responses carry usage inside their terminal structures
+// (message_delta, response.completed), and injecting a bare frame there would
+// make a strict client reject the stream.
+//
+// The frame is marked "estimated": true because it is an estimate, not a
+// bill; the only exact accounting is a non-streaming request.
+func (observer *streamUsageTracker) emitEstimatedUsage() error {
+	if observer.forward == nil || observer.estimate == nil || observer.reported {
+		return nil
+	}
+	if observer.protocol != Chat || !observer.normal {
+		return nil
+	}
+	usage := *observer.estimate
+	if observer.generated > 0 {
+		usage.Output = EstimateCompletionTokens(observer.generated)
+	}
+	usage.Total = usage.Input + usage.Output
+	data, err := json.Marshal(map[string]any{
+		"id":        asPrefix(observer.id, "chatcmpl"),
+		"object":    "chat.completion.chunk",
+		"created":   time.Now().Unix(),
+		"model":     observer.model,
+		"choices":   []any{},
+		"usage":     openAIUsage(usage),
+		"estimated": true,
+	})
+	if err != nil {
+		return err
+	}
+	if err := observer.forward([]byte("data: " + string(data) + "\n\n")); err != nil {
+		return err
+	}
+	observer.synthesised = true
+	// Record it as the reported usage, so telemetry sees the same numbers the
+	// client does. Reported() still answers false: this is not a bill.
+	observer.usage = usage
+	return nil
+}
+
 // Finish returns the merged usage and discards the buffered tail.
 func (observer *streamUsageTracker) Finish() Usage {
 	// An unterminated final line is not an SSE frame. In particular, do not
@@ -722,7 +800,16 @@ func (observer *streamUsageTracker) Finish() Usage {
 	return observer.usage
 }
 
+// Reported reports whether the usage the caller receives was actually
+// reported by the upstream. A synthesised estimate does not count: the caller
+// records it as an estimate, not as a bill.
 func (observer *streamUsageTracker) Reported() bool { return observer.reported }
+
+// Synthesised reports whether a usage frame was synthesised from the
+// pre-request estimate.
+func (observer *streamUsageTracker) Synthesised() bool {
+	return !observer.reported && observer.estimate != nil && observer.synthesised
+}
 
 func (observer *streamUsageTracker) ParseError() error { return observer.parseErr }
 
@@ -741,8 +828,20 @@ func (observer *streamUsageTracker) consume(frame []byte) {
 			switch event.Kind {
 			case "done":
 				observer.normal = true
+				observer.terminal = true
 			case "error":
 				observer.error = true
+			case "start":
+				if event.ResponseID != "" {
+					observer.id = event.ResponseID
+				}
+				if event.Model != "" {
+					observer.model = event.Model
+				}
+			case "text", "reasoning":
+				observer.generated += len([]rune(event.Text))
+			case "tool_delta":
+				observer.generated += len([]rune(event.Text))
 			}
 			if event.Usage != nil {
 				observer.reported = true

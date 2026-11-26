@@ -36,17 +36,21 @@ type bridgeStreamTool struct {
 // blocks are open so each protocol's block ordering is respected, and records
 // usage as it goes.
 type bridgeStreamEncoder struct {
-	w                  io.Writer
-	flush              http.Flusher
-	target             Protocol
-	model              string
-	id                 string
-	created            int64
-	started            bool
-	done               bool
-	stop               string
-	usage              Usage
-	usageReported      bool
+	w             io.Writer
+	flush         http.Flusher
+	target        Protocol
+	model         string
+	id            string
+	created       int64
+	started       bool
+	done          bool
+	stop          string
+	usage         Usage
+	usageReported bool
+	// usageEstimated marks a usage the gateway synthesised because the
+	// upstream reported none. The frame then carries "estimated": true so a
+	// reader can tell an estimate from a bill.
+	usageEstimated     bool
 	reasoningEncrypted string
 	text               strings.Builder
 	reasoning          strings.Builder
@@ -555,14 +559,18 @@ func (emitter *bridgeStreamEncoder) Finish() error {
 		if err := emitter.chatChunk(map[string]any{}, chatStop(emitter.stop)); err != nil {
 			return err
 		}
-		if err := emitter.sse("", map[string]any{
+		usageFrame := map[string]any{
 			"id":      asPrefix(emitter.id, "chatcmpl"),
 			"object":  "chat.completion.chunk",
 			"created": emitter.created,
 			"model":   emitter.model,
 			"choices": []any{},
 			"usage":   openAIUsage(emitter.usage),
-		}); err != nil {
+		}
+		if emitter.usageEstimated {
+			usageFrame["estimated"] = true
+		}
+		if err := emitter.sse("", usageFrame); err != nil {
 			return err
 		}
 		return emitter.rawSSE("", "[DONE]")
@@ -587,11 +595,15 @@ func (emitter *bridgeStreamEncoder) Finish() error {
 				}
 			}
 		}
-		if err := emitter.sse("message_delta", map[string]any{
+		delta := map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": anthropicStop(emitter.stop), "stop_sequence": nil},
 			"usage": anthropicUsage(emitter.usage),
-		}); err != nil {
+		}
+		if emitter.usageEstimated {
+			delta["estimated"] = true
+		}
+		if err := emitter.sse("message_delta", delta); err != nil {
 			return err
 		}
 		return emitter.sse("message_stop", map[string]any{"type": "message_stop"})
@@ -617,7 +629,11 @@ func (emitter *bridgeStreamEncoder) Finish() error {
 			response.Tools = append(response.Tools, bridgeBlock{Kind: "tool_call", ID: tool.ID, Name: tool.Name, ArgumentsJSON: tool.Arguments.String()})
 		}
 		completed := encodeBridgeResponse(Responses, response)
-		return emitter.sse("response.completed", map[string]any{"type": "response.completed", "response": completed, "sequence_number": emitter.nextSequence()})
+		payload := map[string]any{"type": "response.completed", "response": completed, "sequence_number": emitter.nextSequence()}
+		if emitter.usageEstimated {
+			payload["estimated"] = true
+		}
+		return emitter.sse("response.completed", payload)
 	}
 	return nil
 }

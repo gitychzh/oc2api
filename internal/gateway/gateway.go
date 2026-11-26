@@ -143,6 +143,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	catalog.SetFreeOnly(cfg.Models.FreeOnly)
 	redactor := config.SecretRedactor()
 	redactor.Replace(cfg)
+	demoteBase, demoteMax := demoteWindow(cfg)
 	gateway := &Gateway{
 		cfg:            cfg,
 		rotation:       rotationManager,
@@ -151,7 +152,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 		transports:     transports,
 		zenNodes:       zenNodes,
 		goNodes:        goNodes,
-		anonymous:      anonymousPool(cfg.Anonymous, transports, cooldown, anonymousBackoffFromConfig(cfg.Models.AnonymousBackoff)),
+		anonymous:      anonymousPool(cfg.Anonymous, transports, cooldown, anonymousBackoffFromConfig(cfg.Models.AnonymousBackoff), demoteBase, demoteMax),
 		warp:           warpPool,
 		catalog:        catalog,
 		monitor:        monitor,
@@ -160,6 +161,23 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	}
 	gateway.restoreOAuthCatalog()
 	return gateway, nil
+}
+
+// demoteWindow returns the per-exit demotion window and its ceiling from the
+// configuration, falling back to the built-in values when a setting is zero.
+func demoteWindow(cfg config.Config) (base, max time.Duration) {
+	base = demoteSecondsDefault
+	if cfg.Performance.ExitDemoteSeconds > 0 {
+		base = time.Duration(cfg.Performance.ExitDemoteSeconds) * time.Second
+	}
+	max = demoteSecondsMaxDefault
+	if cfg.Performance.ExitDemoteMaxSeconds > 0 {
+		max = time.Duration(cfg.Performance.ExitDemoteMaxSeconds) * time.Second
+	}
+	if max < base {
+		max = base
+	}
+	return base, max
 }
 
 // anonymousBackoffFromConfig converts the configured hours into the breaker's
@@ -373,6 +391,16 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			meta.Request = ids.Request
 			meta.Session = ids.Session
 		}
+		// The free tier's prompt gate is a character rule far below the
+		// advertised token window, so refuse an oversized prompt here instead
+		// of paying a round trip and an egress lease for the same answer. The
+		// refusal keeps the vendor's own wording because opencode starts a
+		// compaction only when it recognises that shape.
+		if err := enforcePromptGate(payload, route.ID, external); err != nil {
+			g.logger.Info("refused an oversized prompt before contacting the upstream", "component", "policy", "event", "prompt_gate_refused", "request_id", ids.Request, "model", route.ID, "tier", route.Tier, "error", err.Error())
+			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", ids.Request)
+			return
+		}
 		stream := jsonutil.BoolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
@@ -474,12 +502,17 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			streamBody := wire.RenameStreamReader(resp.Body, upstreamRoute.Protocol, toolRenames)
 			var usage wire.Usage
 			var usageReported bool
+			// The free tier's streams carry no usage frame, so a streaming
+			// client reads zero tokens for the whole session. Hand the
+			// measured prompt estimate down for ForwardStream to emit when the
+			// upstream reports nothing.
+			estimate := wire.Usage{Input: estimatePromptTokens(payload, external)}
 			if external == upstreamRoute.Protocol {
 				streamWriter := w
 				if flusher, ok := w.(http.Flusher); ok {
 					streamWriter = &deferredStreamWriter{ResponseWriter: w, flusher: flusher, status: resp.StatusCode}
 				}
-				usage, usageReported, err = wire.ForwardStream(r.Context(), streamWriter, streamBody, upstreamRoute.Protocol, model)
+				usage, usageReported, err = wire.ForwardStream(r.Context(), streamWriter, streamBody, upstreamRoute.Protocol, model, &estimate)
 			} else {
 				w.WriteHeader(resp.StatusCode)
 				usage, usageReported, err = wire.TranscodeStream(r.Context(), w, streamBody, upstreamRoute.Protocol, external, model)

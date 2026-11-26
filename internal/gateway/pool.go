@@ -38,6 +38,60 @@ type proxyTransport struct {
 	healthy      atomic.Bool
 	checking     atomic.Bool
 	blockedUntil atomic.Int64
+	// demotedUntil is when this exit stops being tried last. Unlike
+	// blockedUntil it is not a verdict about the egress IP: a transport
+	// failure or a 5xx only means this leg is momentarily unhealthy, so the
+	// exit stays in the rotation and merely moves to the end of the order.
+	// The two are kept apart on purpose — conflating them turns a flaky
+	// uplink into a fake quota verdict.
+	demotedUntil atomic.Int64
+	// demoteStreak counts consecutive demotions, so the window can grow.
+	demoteStreak atomic.Uint32
+}
+
+// demoteSecondsDefault and demoteSecondsMaxDefault are the built-in demotion
+// window and its ceiling. A demoted exit is still tried, just last, so the
+// window only has to outlast a few requests.
+const (
+	demoteSecondsDefault    = 20 * time.Second
+	demoteSecondsMaxDefault = 300 * time.Second
+)
+
+// demoted reports whether this exit is currently demoted.
+func (t *proxyTransport) demoted(now time.Time) bool {
+	if t == nil {
+		return false
+	}
+	return t.demotedUntil.Load() > now.UnixNano()
+}
+
+// markDemoted pushes this exit to the end of the selection order for a window
+// that grows with the consecutive-failure streak, capped at max. It never
+// removes the exit from the rotation.
+func (t *proxyTransport) markDemoted(base, max time.Duration, now time.Time) {
+	if t == nil || base <= 0 {
+		return
+	}
+	streak := t.demoteStreak.Add(1)
+	delay := base
+	// Double per consecutive failure, bounded by max, so a persistently dead
+	// leg stops being tried on every request without ever being evicted.
+	for step := uint32(1); step < streak && delay < max; step++ {
+		delay *= 2
+	}
+	if delay > max {
+		delay = max
+	}
+	t.demotedUntil.Store(now.Add(delay).UnixNano())
+}
+
+// clearDemotion restores an exit to the front of the order after a success.
+func (t *proxyTransport) clearDemotion() {
+	if t == nil {
+		return
+	}
+	t.demoteStreak.Store(0)
+	t.demotedUntil.Store(0)
 }
 
 // proxyTransports holds every configured proxy route, indexed by
@@ -72,6 +126,10 @@ type anonymousNodes struct {
 	next     atomic.Uint64
 	cooldown time.Duration
 	hasPool  bool
+	// demoteBase and demoteMax bound the per-exit demotion window (see
+	// proxyTransport.markDemoted). Zero disables demotion entirely.
+	demoteBase time.Duration
+	demoteMax  time.Duration
 	// breaker stops the whole lane after repeated failures or when every
 	// exit is under the free tier's IP block: the lane then pauses for
 	// backoff.base, doubling every further trip (one strike per trip) up to
@@ -109,8 +167,8 @@ type anonymousCursor struct {
 
 // anonymousPool builds one anonymous node per proxy transport, or an empty
 // pool when the anonymous tier is disabled.
-func anonymousPool(enabled bool, transports *proxyTransports, cooldown time.Duration, backoff anonymousBackoff) *anonymousNodes {
-	pool := &anonymousNodes{cooldown: cooldown, backoff: backoff}
+func anonymousPool(enabled bool, transports *proxyTransports, cooldown time.Duration, backoff anonymousBackoff, demoteBase, demoteMax time.Duration) *anonymousNodes {
+	pool := &anonymousNodes{cooldown: cooldown, backoff: backoff, demoteBase: demoteBase, demoteMax: demoteMax}
 	if !enabled || transports == nil {
 		return pool
 	}
@@ -334,6 +392,9 @@ func (c *anonymousCursor) Next() *anonymousNode {
 	isBlocked := func(node *anonymousNode) bool {
 		return node.proxy != nil && node.proxy.blockedUntil.Load() > now
 	}
+	isDemoted := func(node *anonymousNode) bool {
+		return node.proxy != nil && node.proxy.demotedUntil.Load() > now
+	}
 	for c.offset < n {
 		idx := (c.start + c.offset) % n
 		c.offset++
@@ -345,7 +406,14 @@ func (c *anonymousCursor) Next() *anonymousNode {
 			c.used[idx] = true
 			continue
 		}
-		if node.proxy.pool || (!c.used[idx] && node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now) {
+		if node.proxy.pool {
+			c.used[idx] = true
+			return node
+		}
+		// A demoted exit is not skipped: it moves to the end of the order, so
+		// the first pass leaves it for the fallback below. Transport failures
+		// only demote, they never cordon.
+		if !c.used[idx] && node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now && !isDemoted(node) {
 			c.used[idx] = true
 			return node
 		}
@@ -360,9 +428,13 @@ func (c *anonymousCursor) Next() *anonymousNode {
 			}
 		}
 	}
+	// Fallback order: healthy before unhealthy, undemoted before demoted, and
+	// the earliest-expiring cooldown first among equals. This is the order
+	// that keeps a momentarily flaky leg out of the way without ever
+	// pretending it is gone.
 	choice := -1
 	var earliest int64
-	choiceHealthy := false
+	choiceHealthy, choiceDemoted := false, true
 	for step := range n {
 		idx := (c.start + step) % n
 		if c.used[idx] {
@@ -373,9 +445,14 @@ func (c *anonymousCursor) Next() *anonymousNode {
 			continue
 		}
 		healthy := node.proxy.healthy.Load()
+		demoted := isDemoted(node)
 		until := node.cooldownUntil.Load()
-		if choice < 0 || (healthy && !choiceHealthy) || (healthy == choiceHealthy && until < earliest) {
-			choice, earliest, choiceHealthy = idx, until, healthy
+		better := choice < 0 ||
+			(!demoted && choiceDemoted) ||
+			(demoted == choiceDemoted && healthy && !choiceHealthy) ||
+			(demoted == choiceDemoted && healthy == choiceHealthy && until < earliest)
+		if better {
+			choice, earliest, choiceHealthy, choiceDemoted = idx, until, healthy, demoted
 		}
 	}
 	if choice >= 0 {
@@ -391,6 +468,10 @@ func (p *anonymousNodes) MarkSuccess(node *anonymousNode) {
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	// A success clears the demotion at once: the leg is demonstrably usable,
+	// and leaving it demoted would keep pushing live traffic past an exit
+	// that has already recovered.
+	node.proxy.clearDemotion()
 }
 
 // RestoreProxy clears cooldowns for anonymous nodes bound to a recovered
@@ -427,16 +508,40 @@ func (p *anonymousNodes) RestoreProxy(proxy *proxyTransport) int {
 // full.
 const maxAnonymousRetryAfterMultiplier = 8
 
-// MarkFailure cools node down after an error or a 401, 403, 429 or 5xx
-// response; any other response leaves it untouched, and #pool nodes are never
-// cooled. The cooldown doubles with each consecutive failure, from the
-// base cooldown up to 8x, and a longer Retry-After extends it up to that same
-// 8x ceiling.
+// MarkFailure records a failed attempt against node. It applies two distinct
+// verdicts, because they answer different questions:
+//
+//   - demotion (proxyTransport.markDemoted) for a transport failure or a 5xx.
+//     The leg is momentarily unusable; the exit is still fine, so it moves to
+//     the end of the selection order and the current request is answered by
+//     another one. Any number of transport failures only ever demotes.
+//   - cooldown for a 401, 403 or 429. Those are verdicts about the credential
+//     or the egress IP, so the node is set aside for a window that grows with
+//     consecutive failures and honours a longer Retry-After, up to 8x the
+//     base.
+//
+// Conflating the two is what makes a flaky uplink look like a burned quota.
+// #pool nodes are never cooled or demoted: their health is the provider's
+// business and every attempt opens a fresh connection.
 func (p *anonymousNodes) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
 	if node == nil || (node.proxy != nil && node.proxy.pool) {
 		return
 	}
-	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	// Transport failure (no HTTP response) or a 5xx: demote only.
+	if err != nil || status >= 500 {
+		node.proxy.markDemoted(p.demoteBase, p.demoteMax, time.Now())
+		if err == nil && status < 500 {
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+	if err == nil && status != http.StatusUnauthorized && status != http.StatusForbidden && status != http.StatusTooManyRequests && status < 500 {
 		return
 	}
 	failures := node.failures.Add(1)
